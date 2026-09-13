@@ -216,6 +216,33 @@ def scroll_and_select_user(page, username, targets):
                 break
 
 
+def open_chat_page(page, url):
+    """打开聊天页并等待会话列表渲染出来
+
+    抖音页面资源多，"load" 事件经常等不满超时时间，因此导航只等到
+    domcontentloaded；会话列表是否真正渲染交给 wait_for_selector 判断。
+    等不到会话列表时整页重开（覆盖风控/加载慢导致的白屏场景）。
+    """
+    retries = config["taskRetryTimes"]
+    timeout = config["browserTimeout"]
+    for attempt in range(1, retries + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+        except Exception as e:
+            logger.warning(
+                f"打开抖音网页聊天页面 失败（第 {attempt}/{retries} 次），错误：{e}"
+            )
+            continue
+        try:
+            page.wait_for_selector(CONVERSATION_LIST_SELECTOR, timeout=timeout)
+            return
+        except Exception:
+            logger.warning(
+                f"会话列表未加载（第 {attempt}/{retries} 次），准备重新打开页面"
+            )
+    raise RuntimeError("打开抖音聊天页失败：会话列表始终未加载")
+
+
 def do_user_task(browser, username, cookies, targets):
     context = browser.new_context()  # 每个任务使用独立的上下文
     context.set_default_navigation_timeout(
@@ -225,48 +252,43 @@ def do_user_task(browser, username, cookies, targets):
         config["browserTimeout"]
     )  # 设置所有操作的默认超时时间为 120 秒
 
-    page = context.new_page()
+    try:
+        page = context.new_page()
 
-    page.on("response", handle_response)  # 监听响应，收集好友完整信息用于匹配
+        page.on("response", handle_response)  # 监听响应，收集好友完整信息用于匹配
 
-    # 注入 Cookie
-    context.add_cookies(cookies)
+        # 注入 Cookie
+        context.add_cookies(cookies)
 
-    # 打开抖音网页聊天页面
-    retry_operation(
-        "打开抖音网页聊天页面",
-        page.goto,
-        retries=config["taskRetryTimes"],
-        delay=5,
-        url="https://www.douyin.com/chat",
-    )
+        # 打开抖音网页聊天页面，等会话列表真正渲染出来
+        open_chat_page(page, "https://www.douyin.com/chat")
 
-    time.sleep(5)  # 等待5秒让过可能存在的弹窗
+        time.sleep(5)  # 等待5秒让过可能存在的弹窗
 
-    logger.debug(f"账号 {username} 开始发送消息")
-    # 滚动并选择用户
-    for username in scroll_and_select_user(page, username, targets):
-        logger.debug(f"账号 {username} 已选中好友 {username} 发送消息")
-        # 等待聊天输入框元素加载完成，使用更稳定的属性选择器
-        chat_input_selector = CHAT_EDITOR_SELECTOR
-        page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
-        chat_input = page.locator(chat_input_selector)
+        logger.debug(f"账号 {username} 开始发送消息")
+        # 滚动并选择用户
+        for username in scroll_and_select_user(page, username, targets):
+            logger.debug(f"账号 {username} 已选中好友 {username} 发送消息")
+            # 等待聊天输入框元素加载完成，使用更稳定的属性选择器
+            chat_input_selector = CHAT_EDITOR_SELECTOR
+            page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
+            chat_input = page.locator(chat_input_selector)
 
-        # 在 chat-input-dccKiL 中输入内容
-        message = build_message()
-        for line in message.split("\\n"):
-            chat_input.type(line)  # 输入每一行
-            # 如果不是最后一行，模拟 Shift+Enter 插入换行
-            if line != message.split("\\n")[-1]:
-                chat_input.press("Shift+Enter")  # 模拟 Shift+Enter 插入换行
+            # 在 chat-input-dccKiL 中输入内容
+            message = build_message()
+            for line in message.split("\\n"):
+                chat_input.type(line)  # 输入每一行
+                # 如果不是最后一行，模拟 Shift+Enter 插入换行
+                if line != message.split("\\n")[-1]:
+                    chat_input.press("Shift+Enter")  # 模拟 Shift+Enter 插入换行
 
-        logger.debug(f"账号 {username} 准备发送消息给好友 {username}：\n\t{message}")
-        logger.debug(f"账号 {username} 给好友 {username} 发送消息完成")
-        # 模拟按下回车键发送消息
-        chat_input.press("Enter")
-        time.sleep(2)  # 发送完等待一会儿
-
-    context.close()  # 任务完成后关闭上下文
+            logger.debug(f"账号 {username} 准备发送消息给好友 {username}：\n\t{message}")
+            logger.debug(f"账号 {username} 给好友 {username} 发送消息完成")
+            # 模拟按下回车键发送消息
+            chat_input.press("Enter")
+            time.sleep(2)  # 发送完等待一会儿
+    finally:
+        context.close()  # 任务完成后（或失败时）关闭上下文
 
 
 def runTasks():
@@ -288,8 +310,17 @@ def runTasks():
             targets = user["targets"]
             username = user.get("username", "未知用户")
             logger.info(f"开始处理账号 {username}")
-            # 创建任务
-            do_user_task(browser, username, cookies, targets)
+            # 创建任务；单次尝试失败（如页面加载超时）时重新开页整体重试
+            retry_operation(
+                f"账号 {username} 任务",
+                do_user_task,
+                retries=config["taskRetryTimes"],
+                delay=10,
+                browser=browser,
+                username=username,
+                cookies=cookies,
+                targets=targets,
+            )
             logger.info(f"账号 {username} 任务完成")
     finally:
         # 关闭浏览器实例
